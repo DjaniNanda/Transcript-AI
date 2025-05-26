@@ -3,6 +3,7 @@ import os
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import threading
+import queue
 from pathlib import Path
 
 class WhisperGUI:
@@ -15,6 +16,10 @@ class WhisperGUI:
         self.selected_files = []
         self.model = None
         self.current_model_size = "base"
+        
+        # Initialize queue and threading components
+        self.transcription_queue = queue.Queue()
+        self.is_processing = False
         
         self.setup_ui()
         
@@ -76,7 +81,60 @@ class WhisperGUI:
         self.transcribe_btn = tk.Button(self.root, text="Start Transcription", 
                                        command=self.start_transcription, 
                                        bg="#FF9800", fg="white", font=("Arial", 12, "bold"))
-        self.transcribe_btn.pack(pady=20)
+        self.transcribe_btn.pack(pady=10)
+        
+        # Pre-download model button
+        self.download_btn = tk.Button(self.root, text="Pre-download Model", 
+                                     command=self.download_model, 
+                                     bg="#9C27B0", fg="white", font=("Arial", 10))
+        self.download_btn.pack(pady=5)
+        
+    def download_model(self):
+        """Pre-download the selected model"""
+        if self.is_processing:
+            messagebox.showwarning("Warning", "Cannot download model while transcription is in progress!")
+            return
+            
+        model_size = self.model_var.get()
+        
+        # Disable buttons
+        self.download_btn.config(state="disabled")
+        self.transcribe_btn.config(state="disabled")
+        self.progress_bar.start()
+        
+        def download_worker():
+            try:
+                self.progress_var.set(f"Downloading {model_size} model...")
+                self.model = whisper.load_model(model_size)
+                self.current_model_size = model_size
+                self.progress_var.set(f"Model {model_size} downloaded successfully!")
+                messagebox.showinfo("Success", f"Model '{model_size}' has been downloaded and cached successfully!")
+                
+            except Exception as e:
+                error_msg = str(e)
+                self.progress_var.set("Model download failed")
+                if "urlopen error" in error_msg or "connection" in error_msg.lower():
+                    messagebox.showerror("Download Failed", 
+                        f"Failed to download model due to network issues.\n\n"
+                        f"Troubleshooting steps:\n"
+                        f"1. Check your internet connection\n"
+                        f"2. Disable firewall/antivirus temporarily\n"
+                        f"3. Try using a VPN if in a restricted network\n"
+                        f"4. Contact your network administrator\n\n"
+                        f"Error: {error_msg}")
+                else:
+                    messagebox.showerror("Error", f"Failed to download model: {error_msg}")
+            
+            finally:
+                # Re-enable buttons
+                self.download_btn.config(state="normal")
+                self.transcribe_btn.config(state="normal")
+                self.progress_bar.stop()
+        
+        # Start download in separate thread
+        thread = threading.Thread(target=download_worker)
+        thread.daemon = True
+        thread.start()
         
     def select_files(self):
         files = filedialog.askopenfilenames(
@@ -109,8 +167,29 @@ class WhisperGUI:
         if self.model is None or self.current_model_size != model_size:
             self.progress_var.set(f"Loading {model_size} model...")
             self.root.update()
-            self.model = whisper.load_model(model_size)
-            self.current_model_size = model_size
+            
+            try:
+                # Try to load the model with error handling
+                self.model = whisper.load_model(model_size)
+                self.current_model_size = model_size
+                
+            except Exception as e:
+                error_msg = str(e)
+                if "urlopen error" in error_msg or "connection" in error_msg.lower():
+                    # Network connection issue
+                    messagebox.showerror("Connection Error", 
+                        f"Failed to download Whisper model due to network issues.\n\n"
+                        f"Solutions:\n"
+                        f"1. Check your internet connection\n"
+                        f"2. Try again later\n"
+                        f"3. If behind a firewall/proxy, configure network settings\n"
+                        f"4. Pre-download models manually\n\n"
+                        f"Error: {error_msg}")
+                else:
+                    messagebox.showerror("Model Loading Error", f"Failed to load model: {error_msg}")
+                
+                self.progress_var.set("Model loading failed")
+                raise e
             
     def transcribe_file(self, file_path, language, output_format):
         try:
@@ -187,9 +266,14 @@ class WhisperGUI:
             messagebox.showwarning("No Files", "Please select audio files first!")
             return
             
+        if self.is_processing:
+            messagebox.showwarning("Warning", "Transcription is already in progress!")
+            return
+            
         # Disable button and start progress
         self.transcribe_btn.config(state="disabled")
         self.progress_bar.start()
+        self.is_processing = True
         
         # Start transcription in separate thread
         thread = threading.Thread(target=self.transcription_worker)
@@ -197,43 +281,69 @@ class WhisperGUI:
         thread.start()
         
     def transcription_worker(self):
-        model_size = self.model_var.get()
-        language = self.language_var.get()
-        output_format = self.format_var.get()
+        """Worker thread for handling transcription tasks"""
+        # Initialize counters at the beginning of the method
+        successful = 0
+        failed = 0
         
         try:
-            # Load model
-            self.load_model(model_size)
+            # Load model with retry logic
+            model_size = self.model_var.get()
             
-            successful = 0
-            failed = 0
+            # Try loading model with retries
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    self.load_model(model_size)
+                    break  # Success, exit retry loop
+                except Exception as e:
+                    if attempt < max_retries - 1:  # Not the last attempt
+                        self.progress_var.set(f"Model loading failed, retrying... ({attempt + 1}/{max_retries})")
+                        import time
+                        time.sleep(2)  # Wait 2 seconds before retry
+                    else:
+                        # Last attempt failed
+                        self.progress_var.set("Model loading failed - check internet connection")
+                        return  # Exit the worker
+            
+            # Get settings
+            language = self.language_var.get()
+            output_format = self.format_var.get()
+            
+            # Process each file
+            total_files = len(self.selected_files)
             
             for i, file_path in enumerate(self.selected_files):
-                filename = os.path.basename(file_path)
-                self.progress_var.set(f"Transcribing {filename} ({i+1}/{len(self.selected_files)})")
-                self.root.update()
-                
-                success, error = self.transcribe_file(file_path, language, output_format)
-                
-                if success:
-                    successful += 1
-                else:
-                    failed += 1
-                    print(f"Error transcribing {filename}: {error}")
+                try:
+                    # Update progress
+                    filename = os.path.basename(file_path)
+                    self.progress_var.set(f"Processing {i+1}/{total_files}: {filename}")
                     
+                    # Transcribe file
+                    success, error = self.transcribe_file(file_path, language, output_format)
+                    
+                    if success:
+                        successful += 1
+                    else:
+                        failed += 1
+                        print(f"Error transcribing {file_path}: {error}")
+                        
+                except Exception as e:
+                    print(f"Error transcribing {file_path}: {str(e)}")
+                    failed += 1
+        
         except Exception as e:
-            messagebox.showerror("Error", f"An error occurred: {str(e)}")
-            
+            print(f"Worker thread error: {str(e)}")
+        
         finally:
-            # Re-enable button and stop progress
+            # Update final progress and reset UI
+            if successful > 0 or failed > 0:
+                self.progress_var.set(f"Completed! {successful} successful, {failed} failed")
+            else:
+                self.progress_var.set("Transcription cancelled due to model loading failure")
             self.progress_bar.stop()
             self.transcribe_btn.config(state="normal")
-            self.progress_var.set(f"Completed! {successful} successful, {failed} failed")
-            
-            if successful > 0:
-                messagebox.showinfo("Complete", 
-                    f"Transcription completed!\n{successful} files processed successfully.\n"
-                    f"Transcripts saved in the same folder as your audio files.")
+            self.is_processing = False
 
 # Simple command-line version
 def transcribe_simple(file_path, model_size="base", language="auto", output_format="txt"):
