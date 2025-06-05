@@ -36,8 +36,15 @@
 3. Install the dependencies:
  
        pip install -r requirements.txt
+   
+   If there is no requirements.txt, create one with:
+   
+        openai-whisper
+        torch
+        tk
 
-4. Make sure ffmpeg is installed and available in your system path:
+
+5. Make sure ffmpeg is installed and available in your system path:
 
   - Windows: Download from ffmpeg.org and add to PATH
   
